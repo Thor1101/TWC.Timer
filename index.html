@@ -1717,7 +1717,7 @@
   // ONLINE (echt uniek voor iedereen) via Supabase: vul hieronder de gegevens van je project in (zie SETUP-ACCOUNTS.md).
   // De "anon"-sleutel is bedoeld om openbaar te zijn. Zet hier NOOIT de "service_role"-sleutel neer.
   // Zolang hier niets staat, werkt het account alleen in deze browser (lokale modus).
-  const ACCOUNT_CONFIG = { url: "", anonKey: "" };
+  const ACCOUNT_CONFIG = { url: "https://kkwmarhjtsfbepgtxrfh.supabase.co", anonKey: "sb_publishable_u4ojPShPHhK4-z4nTDSVFw_DJKpo3WC" };
   const wantsOnline = () => !!(ACCOUNT_CONFIG.url && ACCOUNT_CONFIG.anonKey);
   // Maakt van de ingevulde URL altijd de kale vorm https://project.supabase.co (zonder / of pad erachter, zonder spaties)
   function cleanSupabaseUrl(u) {
@@ -2076,14 +2076,54 @@
       else if (letter === "z") turnWhere(stickers, "F", turns, all);
     });
   }
+  // Zet de kleuren weer in de standaardvolgorde (groen voor, oranje rechts, ...), ook als het algoritme de hele kubus draait
+  function recolorToStandard(st) {
+    const std = { "1,0,0": COLORS.R, "-1,0,0": COLORS.L, "0,1,0": COLORS.U, "0,-1,0": COLORS.D, "0,0,1": COLORS.F, "0,0,-1": COLORS.B };
+    const map = {};
+    st.forEach(s => {
+      if (s.pos[0] === 2 * s.n[0] && s.pos[1] === 2 * s.n[1] && s.pos[2] === 2 * s.n[2]) map[s.color] = std[s.n.join(",")];
+    });
+    st.forEach(s => { s.color = map[s.color] || s.color; });
+  }
   // Stand voor het plaatje: het omgekeerde algoritme op een opgeloste kubus (dan lost het algoritme dit op)
   function caseState(alg) {
     const st = solvedStickers(3);
     applyAlgTo(st, invertAlg(alg));
+    recolorToStandard(st);
     return st;
   }
 
-  // Bovenste laag van boven gezien, met de rand van de vier zijkanten eromheen
+  // PLL-pijlen: van de plek waar een stuk nu zit naar de plek waar het hoort. Posities zijn [x, z] (z = -2 achter, 2 voor).
+  function llArrows(st) {
+    const at = (x, z, nx, nz) => st.find(s => s.pos[1] === 2 && s.pos[0] === x && s.pos[2] === z && s.n[1] === 0 && s.n[0] === nx && s.n[2] === nz);
+    const edgeHome = {};
+    edgeHome[COLORS.F] = [0, 2]; edgeHome[COLORS.R] = [2, 0]; edgeHome[COLORS.B] = [0, -2]; edgeHome[COLORS.L] = [-2, 0];
+    const moves = [];
+    [[[0, 2], [0, 1]], [[2, 0], [1, 0]], [[0, -2], [0, -1]], [[-2, 0], [-1, 0]]].forEach(e => {
+      const s = at(e[0][0], e[0][1], e[1][0], e[1][1]);
+      const to = edgeHome[s.color];
+      if (to[0] !== e[0][0] || to[1] !== e[0][1]) moves.push({ from: e[0], to: to, corner: false });
+    });
+    const isX = c => c === COLORS.R || c === COLORS.L;
+    [[2, 2], [2, -2], [-2, -2], [-2, 2]].forEach(p => {
+      const c1 = at(p[0], p[1], Math.sign(p[0]), 0).color, c2 = at(p[0], p[1], 0, Math.sign(p[1])).color;
+      const cx = isX(c1) ? c1 : c2, cz = isX(c1) ? c2 : c1;
+      const to = [cx === COLORS.R ? 2 : -2, cz === COLORS.F ? 2 : -2];
+      if (to[0] !== p[0] || to[1] !== p[1]) moves.push({ from: p, to: to, corner: true });
+    });
+    // twee stukken die van plek wisselen: een pijl met twee punten
+    const out = [];
+    moves.forEach(m => {
+      const back = moves.find(o => o.corner === m.corner && o.from[0] === m.to[0] && o.from[1] === m.to[1] && o.to[0] === m.from[0] && o.to[1] === m.from[1]);
+      if (back) {
+        const already = out.find(o => o.corner === m.corner && o.double && o.from[0] === m.to[0] && o.from[1] === m.to[1]);
+        if (!already) out.push({ from: m.from, to: m.to, corner: m.corner, double: true });
+      } else out.push({ from: m.from, to: m.to, corner: m.corner, double: false });
+    });
+    return out;
+  }
+
+  // Bovenste laag van boven gezien, met de rand van de vier zijkanten eromheen (bij PLL met pijlen)
   function llSvg(stickers, mode) {
     const M = 3, T = 7, G = 2, C = 20, X0 = M + T + G;
     const colorOf = s => mode === "oll" ? (s.color === COLORS.U ? "#ffd500" : "#8d97ad") : s.color;
@@ -2099,6 +2139,37 @@
       else if (nx === -1) out += rect(M, X0 + row * C, T, C, s);
       else if (nx === 1) out += rect(X0 + 3 * C + G, X0 + row * C, T, C, s);
     });
+    if (mode === "pll") {
+      const pt = (m, p) => {
+        const col = (p[0] + 2) / 2, row = (p[1] + 2) / 2;
+        const c = [X0 + col * C + C / 2, X0 + row * C + C / 2];
+        return m.corner ? [c[0] + Math.sign(p[0]) * 0.26 * C, c[1] + Math.sign(p[1]) * 0.26 * C] : c; // hoeken iets naar buiten
+      };
+      const f = v => v.toFixed(2);
+      const headPts = (tip, ux, uy) => {
+        const L = 6.5, Wd = 3.4, bx = tip[0] - ux * L, by = tip[1] - uy * L;
+        return f(tip[0]) + "," + f(tip[1]) + " " + f(bx - uy * Wd) + "," + f(by + ux * Wd) + " " + f(bx + uy * Wd) + "," + f(by - ux * Wd);
+      };
+      let halo = "", ink = "";
+      llArrows(stickers).forEach(m => {
+        const a = pt(m, m.from), b = pt(m, m.to);
+        const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, ux = (b[0] - a[0]) / len, uy = (b[1] - a[1]) / len;
+        const trim = 4.5;
+        const x1 = a[0] + (m.double ? ux * trim : 0), y1 = a[1] + (m.double ? uy * trim : 0), x2 = b[0] - ux * trim, y2 = b[1] - uy * trim;
+        const line = '<line x1="' + f(x1) + '" y1="' + f(y1) + '" x2="' + f(x2) + '" y2="' + f(y2) + '"';
+        halo += line + ' stroke="#ffffff" stroke-width="4.6" stroke-linecap="round"/>';
+        ink += line + ' stroke="#0b2a78" stroke-width="2.2" stroke-linecap="round"/>';
+        const h1 = headPts(b, ux, uy);
+        halo += '<polygon points="' + h1 + '" fill="#ffffff" stroke="#ffffff" stroke-width="2.4" stroke-linejoin="round"/>';
+        ink += '<polygon points="' + h1 + '" fill="#0b2a78"/>';
+        if (m.double) {
+          const h2 = headPts(a, -ux, -uy);
+          halo += '<polygon points="' + h2 + '" fill="#ffffff" stroke="#ffffff" stroke-width="2.4" stroke-linejoin="round"/>';
+          ink += '<polygon points="' + h2 + '" fill="#0b2a78"/>';
+        }
+      });
+      out += halo + ink;
+    }
     return out + "</svg>";
   }
 
@@ -2125,6 +2196,36 @@
     { id: "Y",  alg: "F R U' R' U' R U R' F' R U R' U' R' F R F'" },
     { id: "Z",  alg: "M' U M2 U M2 U M' U2 M2" }
   ];
+
+  // Hoeveel hoeken en randen elk PLL-geval verplaatst (hoeken, randen). Daarmee wordt bepaald welke laatste U-draai nodig is
+  // om het plaatje "recht" te zetten, zodat de pijlen laten zien wat het geval echt is.
+  const PLL_SHAPES = {
+    Aa: [3, 0], Ab: [3, 0], E: [4, 0], F: [2, 2], Ga: [3, 3], Gb: [3, 3], Gc: [3, 3], Gd: [3, 3], H: [0, 4], Ja: [2, 2], Jb: [2, 2],
+    Na: [2, 2], Nb: [2, 2], Ra: [2, 2], Rb: [2, 2], T: [2, 2], Ua: [0, 3], Ub: [0, 3], V: [2, 2], Y: [2, 2], Z: [0, 4]
+  };
+  function mergeAuf(alg, auf) { // zet een U-draai achteraan en voeg hem samen met een U-draai die er al staat
+    if (!auf) return alg;
+    const toks = alg.trim().split(/\s+/);
+    const turns = t => (t.endsWith("'") ? 3 : (t.endsWith("2") ? 2 : 1));
+    const last = toks[toks.length - 1];
+    if (last[0] === "U" && last.length <= 2) {
+      const total = (turns(last) + turns(auf)) % 4;
+      toks.pop();
+      if (total) toks.push(total === 1 ? "U" : (total === 2 ? "U2" : "U'"));
+      return toks.join(" ");
+    }
+    return alg + " " + auf;
+  }
+  PLL_CASES.forEach(c => {
+    c.full = c.alg;
+    const want = PLL_SHAPES[c.id].join();
+    for (const k of ["", "U", "U'", "U2"]) {
+      const cand = mergeAuf(c.alg, k);
+      const n = [0, 0];
+      llArrows(caseState(cand)).forEach(a => { n[a.corner ? 0 : 1] += a.double ? 2 : 1; });
+      if (n.join() === want) { c.full = cand; break; }
+    }
+  });
 
   const OLL_ALGS = [
     "R U2 R2 F R F' U2 R' F R F'",
@@ -2232,7 +2333,7 @@
   function caseList(setKey) { return setKey === "PLL" ? PLL_CASES : (setKey === "OLL" ? OLL_CASES : null); }
   function caseImage(setKey, c) {
     const k = setKey + ":" + c.id;
-    if (!caseSvgCache[k]) caseSvgCache[k] = llSvg(caseState(c.alg), setKey === "OLL" ? "oll" : "pll");
+    if (!caseSvgCache[k]) caseSvgCache[k] = llSvg(caseState(c.full || c.alg), setKey === "OLL" ? "oll" : "pll");
     return caseSvgCache[k];
   }
   function renderCases() {
@@ -2240,6 +2341,9 @@
     caseGrid.innerHTML = "";
     pracNote.style.display = list ? "none" : "";
     pracHint.style.display = list ? "" : "none";
+    pracHint.textContent = prac.set === "PLL"
+      ? 'Tik op een plaatje om het algoritme te zien. De pijlen wijzen naar de plek waar elk stuk heen moet. Staat er aan het eind een U-draai, dan is die nodig om de bovenste laag recht te zetten. Vink "geleerd" aan als je de case kent.'
+      : 'Tik op een plaatje om het algoritme te zien. Geel is al goed gedraaid, grijs nog niet. Vink "geleerd" aan als je de case kent.';
     if (!list) return;
     const stored = load("learned_" + prac.set, []);
     const learnedSet = new Set(Array.isArray(stored) ? stored : []);
@@ -2258,7 +2362,7 @@
       if (open[c.id]) {
         const alg = document.createElement("div");
         alg.className = "caseAlg";
-        alg.textContent = c.alg;
+        alg.textContent = c.full || c.alg;
         tile.appendChild(alg);
       }
       const tick = document.createElement("label");
