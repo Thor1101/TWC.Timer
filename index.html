@@ -401,6 +401,8 @@
       <div id="meUserBox" style="display:none">
         <p class="meWelcome">Ingelogd als <b id="meName"></b></p>
         <p class="meNote" id="meSince"></p>
+        <p class="meNote" id="meSync"></p>
+        <button type="button" id="meSyncBtn" class="meSubmit meOut">Nu synchroniseren</button>
         <button type="button" id="meLogout" class="meSubmit meOut">Uitloggen</button>
       </div>
     </div>
@@ -511,6 +513,8 @@
   const tabLogin = document.getElementById("tabLogin");
   const tabSignup = document.getElementById("tabSignup");
   const meLogout = document.getElementById("meLogout");
+  const meSync = document.getElementById("meSync");
+  const meSyncBtn = document.getElementById("meSyncBtn");
   const menuBtn = document.getElementById("menuBtn");
   const menuBackdrop = document.getElementById("menuBackdrop");
   const meBack = document.getElementById("meBack");
@@ -1202,9 +1206,19 @@
   // ---------- Tijden, Ao5 en Ao12 (per puzzel apart bewaard) ----------
   function solvesKey(p) { return p === "333" ? "solves" : "solves_" + p; }
   function loadSolves(p) {
-    return load(solvesKey(p), []).map(s =>
+    const list = load(solvesKey(p), []).map(s =>
       typeof s === "number" ? { ms: s, plus2: false, dnf: false } : s
     );
+    // oudere tijden krijgen een id en tijdstip, zodat ze met je account gesynchroniseerd kunnen worden
+    let changed = false;
+    const now = Date.now();
+    list.forEach((s, i) => {
+      if (!s.id) { s.id = newId(); changed = true; }
+      if (!s.t) { s.t = now - (list.length - i) * 60000; changed = true; }
+      if (!s.u) { s.u = s.t; changed = true; }
+    });
+    if (changed) save(solvesKey(p), list);
+    return list;
   }
   function saveSolves() { save(solvesKey(puzzle), solves); }
   let solves = loadSolves(puzzle);
@@ -1468,9 +1482,12 @@
     inspectStart = null;
     state = "idle";
     timeEl.className = "";
-    const dnfSolve = { ms: 0, plus2: false, dnf: true, scramble: currentScramble };
+    const now = stamp();
+    const dnfSolve = { id: newId(), t: now, u: now, ms: 0, plus2: false, dnf: true, scramble: currentScramble };
     solves.push(dnfSolve);
     saveSolves();
+    markDirty(dnfSolve.id, puzzle);
+    scheduleSync();
     dailyFinish(dnfSolve);
     timeEl.textContent = "DNF";
     render();
@@ -1492,9 +1509,12 @@
   function stopSolve() {
     cancelAnimationFrame(raf);
     const t = performance.now() - startTime;
-    const solve = { ms: t, plus2: penalty > 0, dnf: false, scramble: currentScramble };
+    const now = stamp();
+    const solve = { id: newId(), t: now, u: now, ms: t, plus2: penalty > 0, dnf: false, scramble: currentScramble };
     solves.push(solve);
     saveSolves();
+    markDirty(solve.id, puzzle);
+    scheduleSync();
     dailyFinish(solve);
     state = "idle";
     timeEl.textContent = fmtSolve(solve);
@@ -1594,8 +1614,12 @@
       return;
     } else if (action === "plus2") {
       s.plus2 = !s.plus2;
+      s.u = stamp();
+      markDirty(s.id, puzzle);
     } else if (action === "dnf") {
       s.dnf = !s.dnf;
+      s.u = stamp();
+      markDirty(s.id, puzzle);
     } else if (action === "scramble") {
       openIdx = i;
       scrOpen = !scrOpen;
@@ -1603,6 +1627,7 @@
       return;
     } else if (action === "delete") {
       if (!confirm("Deze tijd verwijderen?")) return;
+      tombstone(s, puzzle);
       solves.splice(i, 1);
       openIdx = null;
       scrOpen = false;
@@ -1614,6 +1639,7 @@
     }
     saveSolves();
     refreshAfterEdit();
+    scheduleSync();
   }
 
   listEl.addEventListener("click", e => {
@@ -1635,6 +1661,7 @@
     e.target.blur();
     if (!solves.length) return;
     if (!confirm("Alle tijden van " + PUZZLES[puzzle].name + " wissen?")) return;
+    solves.forEach(x => tombstone(x, puzzle));
     solves = [];
     openIdx = null;
     scrOpen = false;
@@ -1642,6 +1669,7 @@
     timeEl.textContent = "0.000";
     render();
     renderDelta();
+    scheduleSync();
   });
 
   // ---------- Puzzel kiezen (balk linksboven) ----------
@@ -1795,8 +1823,10 @@
 
   // ----- online modus (Supabase) -----
   function setOnlineUser(u) {
-    onlineUser = u ? { email: u.email || "", name: (u.user_metadata && u.user_metadata.username) || "", created: String(u.created_at || "").slice(0, 10) } : null;
+    onlineUser = u ? { id: u.id, email: u.email || "", name: (u.user_metadata && u.user_metadata.username) || "", created: String(u.created_at || "").slice(0, 10) } : null;
     renderMe();
+    if (u && lastLoginUid !== u.id) { lastLoginUid = u.id; onLogin(u); }
+    if (!u) { lastLoginUid = null; clearTimeout(syncTimer); }
   }
   function initAccounts() {
     if (sb || !wantsOnline()) { renderMe(); return; }
@@ -1847,11 +1877,168 @@
   }
   async function onlineLogout() {
     try {
+      try { await pushDirty(); } catch (e) { /* geen verbinding: de tijden blijven bewaard en gaan later mee */ }
       const r = await sb.auth.signOut();
       if (r && r.error) return authFail(mapAuthError(r.error));
       return authOk("Je bent uitgelogd.");
     } catch (e) { return authFail(mapAuthError(e)); }
   }
+
+  // ---------- Tijden op je account (synchroniseren met Supabase) ----------
+  // Elke solve heeft een eigen id (id), een tijdstip (t) en een laatste-aanpassing (u). Daarmee kunnen de tijden van
+  // verschillende apparaten samengevoegd worden. Een tijd die je verwijdert wordt als "verwijderd" doorgegeven.
+  function newId() {
+    const cr = cryptoObj();
+    if (cr && cr.randomUUID) return cr.randomUUID();
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  }
+  function stamp() { return Date.now(); }
+  let syncDirty = load("sync_dirty", {});   // { solve-id: puzzel } wat nog naar je account moet
+  let syncDead = load("sync_dead", {});     // { solve-id: { p, t, u } } verwijderde tijden die nog doorgegeven moeten worden
+  let syncState = load("sync_state", { owner: null, last: 0 });
+  let syncing = false, syncAgain = false, syncTimer = null, syncRetry = null, lastLoginUid = null;
+
+  function saveSync() { save("sync_dirty", syncDirty); save("sync_dead", syncDead); save("sync_state", syncState); }
+  function getList(p) { return p === puzzle ? solves : loadSolves(p); }
+  function setList(p, list) { save(solvesKey(p), list); if (p === puzzle) solves = list; }
+  function markDirty(id, p) { syncDirty[id] = p; saveSync(); }
+  function tombstone(sol, p) { syncDead[sol.id] = { p: p, t: sol.t || 0, u: stamp() }; syncDirty[sol.id] = p; saveSync(); }
+  function syncEnabled() { return !!(sb && onlineUser && onlineUser.id); }
+  function scheduleSync(delay) {
+    if (!syncEnabled()) return;
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(() => syncNow(false), delay || 1200);
+  }
+  function setSyncStatus(text, isErr) {
+    meSync.textContent = text;
+    meSync.className = "meNote" + (isErr ? " warn" : "");
+  }
+  function mapSyncError(e) {
+    const m = String((e && (e.message || e.details)) || e || "").toLowerCase();
+    if (m.indexOf("solves") >= 0 && (m.indexOf("schema cache") >= 0 || m.indexOf("does not exist") >= 0 || (e && e.code === "42P01"))) {
+      return "De tabel voor je tijden ontbreekt in Supabase. Voer sync.sql uit (zie SETUP-ACCOUNTS.md).";
+    }
+    if (m.indexOf("jwt") >= 0 || m.indexOf("not authenticated") >= 0) return "Je bent niet meer ingelogd. Log opnieuw in.";
+    if (m.indexOf("failed to fetch") >= 0 || m.indexOf("network") >= 0) return "Geen verbinding. Je tijden worden later gesynchroniseerd.";
+    return "Synchroniseren mislukt: " + ((e && e.message) || "onbekende fout");
+  }
+
+  // Wat hier nog niet op je account staat, gaat erheen
+  async function pushDirty() {
+    const ids = Object.keys(syncDirty);
+    if (!ids.length || !onlineUser) return;
+    const uid = onlineUser.id, rows = [], sent = {};
+    ids.forEach(id => {
+      const p = syncDirty[id], dead = syncDead[id];
+      if (dead) {
+        rows.push({ user_id: uid, id: id, puzzle: dead.p || p, ms: 0, plus2: false, dnf: false, scramble: null, t: dead.t || 0, u: dead.u, deleted: true });
+        sent[id] = dead.u;
+        return;
+      }
+      const sol = getList(p).find(x => x.id === id);
+      if (sol) {
+        rows.push({ user_id: uid, id: sol.id, puzzle: p, ms: sol.ms, plus2: !!sol.plus2, dnf: !!sol.dnf, scramble: sol.scramble || null, t: sol.t, u: sol.u, deleted: false });
+        sent[id] = sol.u;
+      } else delete syncDirty[id];
+    });
+    for (let i = 0; i < rows.length; i += 400) {
+      const r = await sb.from("solves").upsert(rows.slice(i, i + 400), { onConflict: "user_id,id" });
+      if (r.error) throw r.error;
+    }
+    ids.forEach(id => { // alleen als hij intussen niet nog eens is aangepast
+      let cur = null;
+      if (syncDead[id]) cur = syncDead[id].u;
+      else if (syncDirty[id]) { const sol = getList(syncDirty[id]).find(x => x.id === id); cur = sol ? sol.u : null; }
+      if (sent[id] !== undefined && cur === sent[id]) { delete syncDirty[id]; delete syncDead[id]; }
+    });
+    saveSync();
+  }
+
+  // Wijzigingen van je account (ook van andere apparaten) in de lijsten op dit apparaat verwerken
+  function mergeRows(rows) {
+    const touched = {};
+    rows.forEach(r => {
+      if (!PUZZLES[r.puzzle] || syncDead[r.id]) return;
+      const p = r.puzzle;
+      const list = touched[p] || (touched[p] = getList(p).slice());
+      const i = list.findIndex(x => x.id === r.id);
+      if (r.deleted) { if (i >= 0) list.splice(i, 1); return; }
+      const rec = { id: r.id, t: r.t, u: r.u, ms: r.ms, plus2: !!r.plus2, dnf: !!r.dnf };
+      if (r.scramble) rec.scramble = r.scramble;
+      if (i < 0) list.push(rec);
+      else if ((list[i].u || 0) < r.u) list[i] = rec;
+    });
+    Object.keys(touched).forEach(p => {
+      touched[p].sort((a, b) => (a.t - b.t) || (a.id < b.id ? -1 : 1));
+      setList(p, touched[p]);
+    });
+    return Object.keys(touched);
+  }
+  async function pullChanges() {
+    const since = Math.max(0, (syncState.last || 0) - 300000); // 5 minuten marge voor klokverschil tussen apparaten
+    const rows = [], page = 1000;
+    for (let from = 0; ; from += page) {
+      const r = await sb.from("solves").select("id,puzzle,ms,plus2,dnf,scramble,t,u,deleted").gt("u", since)
+        .order("u", { ascending: true }).order("id", { ascending: true }).range(from, from + page - 1);
+      if (r.error) throw r.error;
+      r.data.forEach(x => rows.push(x));
+      if (r.data.length < page) break;
+    }
+    const touched = mergeRows(rows);
+    let maxU = syncState.last || 0;
+    rows.forEach(r => { if (r.u > maxU) maxU = r.u; });
+    syncState.last = Math.max(maxU, 1);
+    saveSync();
+    if (touched.length) {
+      openIdx = null;
+      scrOpen = false;
+      render();
+      if (view === "me") renderMyStats();
+    }
+  }
+
+  async function syncNow(withPull) {
+    if (!syncEnabled()) return;
+    if (syncing) { syncAgain = true; return; }
+    syncing = true;
+    setSyncStatus("Synchroniseren...", false);
+    try {
+      await pushDirty();
+      if (withPull) await pullChanges();
+      setSyncStatus("Je tijden staan op je account. Laatst gesynchroniseerd om " + new Date().toTimeString().slice(0, 5) + ".", false);
+    } catch (e) {
+      setSyncStatus(mapSyncError(e), true);
+      clearTimeout(syncRetry);
+      syncRetry = setTimeout(() => syncNow(true), 30000);
+    } finally {
+      syncing = false;
+      if (syncAgain) { syncAgain = false; scheduleSync(300); }
+    }
+  }
+
+  // Bij het inloggen: tijden van dit apparaat gaan naar je account (eerste keer), en de tijden van je account komen hierheen
+  function onLogin(u) {
+    if (syncState.owner && syncState.owner !== u.id) { // een ander account: de tijden van het vorige account niet meenemen
+      Object.keys(PUZZLES).forEach(p => setList(p, []));
+      syncDirty = {};
+      syncDead = {};
+      syncState.last = 0;
+      openIdx = null;
+      scrOpen = false;
+      render();
+    } else if (!syncState.owner) { // eerste keer: alle tijden op dit apparaat gaan mee naar je account
+      Object.keys(PUZZLES).forEach(p => getList(p).forEach(x => { syncDirty[x.id] = p; }));
+    }
+    syncState.owner = u.id;
+    saveSync();
+    syncNow(true);
+  }
+
+  meSyncBtn.addEventListener("click", () => syncNow(true));
+  window.addEventListener("focus", () => syncNow(true));
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) syncNow(true); });
+  const syncInterval = setInterval(() => { if (!document.hidden) syncNow(true); }, 90000);
+  if (syncInterval && syncInterval.unref) syncInterval.unref();
 
   // ----- gemeenschappelijk -----
   function currentUser() {
@@ -1913,7 +2100,7 @@
     meSince.textContent = u ? (u.email || "") + (u.created ? "  \u00b7  account gemaakt op " + u.created : "") : "";
     meSub.textContent = u ? u.name : "";
     meModeNote.textContent = wantsOnline()
-      ? (accLoadFailed ? serviceFailMsg() : "Je account staat online: je kunt op elk apparaat inloggen met je e-mailadres en wachtwoord. Je naam is uniek, niemand anders kan hem gebruiken.")
+      ? (accLoadFailed ? serviceFailMsg() : "Je account staat online: je kunt op elk apparaat inloggen met je e-mailadres en wachtwoord. Je naam is uniek, niemand anders kan hem gebruiken. Je tijden staan ook op je account en zijn op elk apparaat te zien.")
       : "Let op: dit account werkt nu alleen op dit apparaat. Om op verschillende apparaten (laptop, gsm) met hetzelfde e-mailadres in te kunnen loggen, moet je eerst de online database koppelen. Zie SETUP-ACCOUNTS.md.";
     const urlBad = wantsOnline() && urlLooksWrong();
     if (urlBad) meModeNote.textContent = "De Project URL in index.html lijkt niet te kloppen. Hij hoort te eindigen op .supabase.co, bijvoorbeeld https://jouwproject.supabase.co (zonder / erachter).";
